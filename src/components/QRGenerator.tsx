@@ -7,6 +7,7 @@ import { QRCodeSVG } from "qrcode.react"
 import type { Transaction, QRData } from "../types"
 import { generateId, signTransaction } from "../utils/crypto"
 import { saveTransaction } from "../utils/storage"
+import { notificationService } from "../utils/notifications"
 import { Button } from "./ui/button"
 import { Input } from "./ui/input"
 import { Label } from "./ui/label"
@@ -14,7 +15,7 @@ import { Textarea } from "./ui/textarea"
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "./ui/card"
 import { toast } from "./ui/use-toast"
 import { Badge } from "./ui/badge"
-import { ShieldCheck, Clock, QrCode, Sparkles, Copy, Download } from "lucide-react"
+import { ShieldCheck, Clock, QrCode, Sparkles, Copy, Download, CheckCircle, Volume2, VolumeX } from "lucide-react"
 
 const QRGenerator: React.FC = () => {
   const [amount, setAmount] = useState<string>("")
@@ -24,6 +25,9 @@ const QRGenerator: React.FC = () => {
   const [isGenerating, setIsGenerating] = useState<boolean>(false)
   const [timeLeft, setTimeLeft] = useState<number>(10)
   const [isExpired, setIsExpired] = useState<boolean>(false)
+  const [paymentReceived, setPaymentReceived] = useState<boolean>(false)
+  const [paymentDetails, setPaymentDetails] = useState<any>(null)
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(true)
 
   useEffect(() => {
     let timer: NodeJS.Timeout
@@ -34,6 +38,9 @@ const QRGenerator: React.FC = () => {
           if (prev <= 1) {
             setIsExpired(true)
             setQrData(null)
+            if (soundEnabled) {
+              notificationService.notifyError("QR code has expired. Please generate a new one.")
+            }
             toast({
               title: "QR Code Expired",
               description: "The QR code has expired. Please generate a new one.",
@@ -49,10 +56,56 @@ const QRGenerator: React.FC = () => {
     return () => {
       if (timer) clearInterval(timer)
     }
-  }, [qrData, isExpired])
+  }, [qrData, isExpired, soundEnabled])
+
+  useEffect(() => {
+    if (!qrData) return
+
+    // Listen for payment completion events
+    const handlePaymentReceived = (event: CustomEvent) => {
+      const { transactionId, amount: paidAmount, sender } = event.detail
+
+      if (transactionId === qrData.transaction.id) {
+        setPaymentReceived(true)
+        setPaymentDetails({
+          amount: paidAmount,
+          sender: sender,
+          timestamp: Date.now(),
+        })
+
+        // Automatically add received payment to transaction history
+        const { addReceivedTransaction, updateTransactionStatus } = require("../utils/storage")
+
+        // Update the original transaction status to completed
+        updateTransactionStatus(qrData.transaction.id, "verified")
+
+        // Add a new transaction entry for the received payment
+        addReceivedTransaction(qrData.transaction)
+
+        // Play notification sound and show push notification
+        if (soundEnabled) {
+          notificationService.notifyPaymentReceived(paidAmount, sender)
+        }
+
+        toast({
+          title: "Payment Received!",
+          description: `₹${paidAmount.toFixed(2)} received successfully from ${sender.substring(0, 8)}... Added to transaction history.`,
+        })
+      }
+    }
+
+    window.addEventListener("paymentReceived", handlePaymentReceived as EventListener)
+
+    return () => {
+      window.removeEventListener("paymentReceived", handlePaymentReceived as EventListener)
+    }
+  }, [qrData, soundEnabled])
 
   const handleGenerate = () => {
     if (!amount || !recipient) {
+      if (soundEnabled) {
+        notificationService.notifyError("Please enter an amount and recipient.")
+      }
       toast({
         title: "Missing information",
         description: "Please enter an amount and recipient.",
@@ -63,6 +116,9 @@ const QRGenerator: React.FC = () => {
 
     const amountValue = Number.parseFloat(amount)
     if (isNaN(amountValue) || amountValue <= 0) {
+      if (soundEnabled) {
+        notificationService.notifyError("Please enter a valid positive number.")
+      }
       toast({
         title: "Invalid amount",
         description: "Please enter a valid positive number.",
@@ -109,6 +165,11 @@ const QRGenerator: React.FC = () => {
       setQrData(newQrData)
       setIsGenerating(false)
 
+      // Play notification sound for QR generation
+      if (soundEnabled) {
+        notificationService.notifyQRGenerated(amountValue)
+      }
+
       toast({
         title: "QR Code Generated",
         description: "Transaction has been digitally signed and is ready to share. Valid for 10 seconds.",
@@ -123,11 +184,16 @@ const QRGenerator: React.FC = () => {
     setDescription("")
     setIsExpired(false)
     setTimeLeft(10)
+    setPaymentReceived(false)
+    setPaymentDetails(null)
   }
 
   const handleCopyQR = () => {
     if (qrData) {
       navigator.clipboard.writeText(JSON.stringify(qrData))
+      if (soundEnabled) {
+        notificationService.playNotificationSound()
+      }
       toast({
         title: "Copied to clipboard",
         description: "QR code data has been copied to your clipboard.",
@@ -136,15 +202,36 @@ const QRGenerator: React.FC = () => {
   }
 
   const handleDownloadQR = () => {
-    // Implementation for downloading QR code as image
+    if (soundEnabled) {
+      notificationService.playNotificationSound()
+    }
     toast({
       title: "Download started",
       description: "QR code image will be downloaded shortly.",
     })
   }
 
+  const toggleSound = () => {
+    setSoundEnabled(!soundEnabled)
+    if (!soundEnabled) {
+      notificationService.playNotificationSound()
+    }
+    toast({
+      title: soundEnabled ? "Sound Disabled" : "Sound Enabled",
+      description: soundEnabled ? "Notifications will be silent" : "Sound notifications enabled",
+    })
+  }
+
   return (
     <div className="w-full max-w-md mx-auto">
+      {/* Sound Toggle Button */}
+      <div className="flex justify-end mb-4">
+        <Button variant="outline" size="sm" onClick={toggleSound} className="flex items-center gap-2">
+          {soundEnabled ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
+          {soundEnabled ? "Sound On" : "Sound Off"}
+        </Button>
+      </div>
+
       {!qrData ? (
         <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
           <Card className="bg-white/90 backdrop-blur-sm shadow-xl border-0 overflow-hidden">
@@ -222,6 +309,73 @@ const QRGenerator: React.FC = () => {
                     Generate Secure QR Code
                   </>
                 )}
+              </Button>
+            </CardFooter>
+          </Card>
+        </motion.div>
+      ) : paymentReceived ? (
+        <motion.div
+          initial={{ opacity: 0, scale: 0.9 }}
+          animate={{ opacity: 1, scale: 1 }}
+          transition={{ duration: 0.3 }}
+          className="flex flex-col items-center space-y-6"
+        >
+          <Card className="bg-white shadow-2xl border-0 w-full overflow-hidden">
+            <CardHeader className="bg-gradient-to-r from-green-500 to-emerald-500 text-white text-center py-8">
+              <div className="flex items-center justify-center mb-4">
+                <motion.div
+                  className="bg-white/20 rounded-full p-4"
+                  animate={{ scale: [1, 1.1, 1] }}
+                  transition={{ repeat: 3, duration: 0.5 }}
+                >
+                  <CheckCircle className="h-12 w-12" />
+                </motion.div>
+              </div>
+              <CardTitle className="text-2xl font-bold">Payment Received!</CardTitle>
+              <p className="text-green-100 mt-2">Transaction completed successfully</p>
+            </CardHeader>
+
+            <CardContent className="flex flex-col items-center pt-8 pb-6">
+              <div className="text-center w-full mb-6">
+                <div className="bg-gradient-to-r from-green-600 to-emerald-600 bg-clip-text text-transparent text-4xl font-bold mb-2">
+                  ₹{paymentDetails?.amount?.toFixed(2)}
+                </div>
+                <div className="text-muted-foreground mb-1">Received from</div>
+                <div className="font-semibold text-lg mb-4">{paymentDetails?.sender?.substring(0, 12)}...</div>
+
+                <div className="bg-green-50 rounded-lg p-4 mb-4">
+                  <div className="text-sm text-green-700 mb-2">Transaction Details</div>
+                  <div className="space-y-2 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Transaction ID:</span>
+                      <span className="font-mono">{qrData?.transaction.id.substring(0, 8)}...</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Time:</span>
+                      <span>{new Date(paymentDetails?.timestamp).toLocaleTimeString()}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Status:</span>
+                      <Badge className="bg-green-500 text-white">Completed</Badge>
+                    </div>
+                  </div>
+                </div>
+
+                {qrData?.transaction.description && (
+                  <div className="bg-muted/50 rounded-lg p-3 mb-4">
+                    <div className="text-xs text-muted-foreground mb-1">Description</div>
+                    <div className="text-sm font-medium">{qrData.transaction.description}</div>
+                  </div>
+                )}
+              </div>
+            </CardContent>
+
+            <CardFooter className="bg-muted/30 pt-6">
+              <Button
+                onClick={handleReset}
+                className="w-full bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white font-semibold"
+              >
+                Generate Another QR Code
               </Button>
             </CardFooter>
           </Card>
