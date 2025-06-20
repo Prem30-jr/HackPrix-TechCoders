@@ -5,16 +5,17 @@ import { useState, useRef, useEffect } from "react"
 import { motion } from "framer-motion"
 import { BrowserQRCodeReader, type IScannerControls } from "@zxing/browser"
 import type { QRData } from "../types"
-import { saveTransaction } from "../utils/storage"
+import { addSentTransaction } from "../utils/storage"
 import { syncTransactionToBlockchain } from "../utils/blockchain"
 import { verifySignature } from "../utils/crypto"
 import { getNetworkState } from "../utils/network"
 import { notificationService } from "../utils/notifications"
+import { paymentEventManager } from "../utils/paymentEvents"
 import { useCredits } from "@/hooks/useCredits"
 import { Card, CardContent, CardFooter } from "./ui/card"
 import { Button } from "./ui/button"
 import { toast } from "./ui/use-toast"
-import { Loader2, AlertCircle, QrCode, Lock, Volume2, VolumeX, CheckCircle } from "lucide-react"
+import { Loader2, AlertCircle, QrCode, Lock, Volume2, VolumeX, CheckCircle, RefreshCw } from "lucide-react"
 
 const QRScanner: React.FC = () => {
   const [scanning, setScanning] = useState<boolean>(true)
@@ -123,6 +124,11 @@ const QRScanner: React.FC = () => {
         throw new Error("Invalid transaction data structure")
       }
 
+      // Stop camera
+      if (controlsRef.current) {
+        controlsRef.current.stop()
+      }
+
       setScannedData(parsedData)
       setScanning(false)
       setProcessingStatus("password_required")
@@ -137,24 +143,6 @@ const QRScanner: React.FC = () => {
       setProcessingStatus("error")
       setScanning(false)
     }
-  }
-
-  const handleError = (err: Error) => {
-    console.error("QR Scanner error:", err)
-    setErrorMessage("Failed to access camera. Please check your permissions and try again.")
-    setProcessingStatus("error")
-    setCameraPermission(false)
-    setScanning(false)
-
-    if (soundEnabled) {
-      notificationService.notifyError("Failed to access your camera. Please check your camera permissions.")
-    }
-
-    toast({
-      title: "Camera Error",
-      description: "Failed to access your camera. Please check your camera permissions.",
-      variant: "destructive",
-    })
   }
 
   const handlePasswordSubmit = () => {
@@ -184,7 +172,7 @@ const QRScanner: React.FC = () => {
       console.log("Processing transaction:", data)
 
       setProcessingStatus("verifying")
-      await new Promise((resolve) => setTimeout(resolve, 300))
+      await new Promise((resolve) => setTimeout(resolve, 500))
 
       const isValid = verifySignature(data.transaction, data.transaction.signature || "", data.publicKey)
 
@@ -200,17 +188,20 @@ const QRScanner: React.FC = () => {
 
       // Store locally
       setProcessingStatus("storing")
-      await new Promise((resolve) => setTimeout(resolve, 300))
-      saveTransaction(data.transaction)
+      await new Promise((resolve) => setTimeout(resolve, 500))
 
       console.log("Updating credits with transaction:", data.transaction)
       updateCredits(data.transaction)
+
+      // Add sent transaction to history
+      addSentTransaction(data.transaction)
 
       // Sync to blockchain
       const { isOnline } = getNetworkState()
       if (isOnline) {
         setProcessingStatus("syncing")
         await syncTransactionToBlockchain(data.transaction)
+        await new Promise((resolve) => setTimeout(resolve, 500))
       }
 
       setProcessingStatus("complete")
@@ -223,19 +214,22 @@ const QRScanner: React.FC = () => {
         transactionId: data.transaction.id,
       })
 
-      // Automatically add sent payment to transaction history
-      const { addSentTransaction } = require("../utils/storage")
-      addSentTransaction(data.transaction)
+      // Emit payment events to notify receiver
+      console.log("Emitting payment received event for transaction:", data.transaction.id)
+      paymentEventManager.emitPaymentReceived(
+        data.transaction.id,
+        data.transaction.amount,
+        data.transaction.recipient,
+        data.transaction.sender,
+      )
 
-      // Notify sender that payment was received
-      const paymentReceivedEvent = new CustomEvent("paymentReceived", {
-        detail: {
-          transactionId: data.transaction.id,
-          amount: data.transaction.amount,
-          sender: data.transaction.sender,
-        },
-      })
-      window.dispatchEvent(paymentReceivedEvent)
+      // Also emit payment sent event
+      paymentEventManager.emitPaymentSent(
+        data.transaction.id,
+        data.transaction.amount,
+        data.transaction.recipient,
+        data.transaction.sender,
+      )
 
       // Play success sound and show notification
       if (soundEnabled) {
@@ -243,10 +237,8 @@ const QRScanner: React.FC = () => {
       }
 
       toast({
-        title: "Payment Sent Successfully",
-        description: `₹${data.transaction.amount.toFixed(2)} sent to ${data.transaction.recipient}. Transaction added to history. ${
-          isOnline ? "Transaction has been verified and synced." : "Transaction will sync when online."
-        }`,
+        title: "Payment Sent Successfully!",
+        description: `₹${data.transaction.amount.toFixed(2)} sent to ${data.transaction.recipient}. Transaction added to history.`,
       })
     } catch (error) {
       console.error("Error processing transaction:", error)
@@ -273,7 +265,8 @@ const QRScanner: React.FC = () => {
     setPaymentDetails(null)
     setPassword("")
     setScanning(true)
-    startScanning()
+    setCameraPermission(null)
+    checkCameraPermission()
   }
 
   const toggleSound = () => {
@@ -336,13 +329,30 @@ const QRScanner: React.FC = () => {
               <p className="text-sm text-muted-foreground mb-4">
                 Please enter the password to verify and process the transaction
               </p>
+
+              {scannedData && (
+                <div className="bg-muted/50 rounded-lg p-4 mb-4 w-full">
+                  <div className="text-sm font-medium mb-2">Transaction Details</div>
+                  <div className="space-y-1 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Amount:</span>
+                      <span className="font-bold text-primary">₹{scannedData.transaction.amount.toFixed(2)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">To:</span>
+                      <span className="font-mono">{scannedData.transaction.recipient.substring(0, 12)}...</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div className="w-full max-w-xs mb-4">
                 <input
                   type="password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   className="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary"
-                  placeholder="Enter password"
+                  placeholder="Enter password (2239)"
                   onKeyPress={(e) => {
                     if (e.key === "Enter") {
                       handlePasswordSubmit()
@@ -351,7 +361,7 @@ const QRScanner: React.FC = () => {
                 />
               </div>
               <Button onClick={handlePasswordSubmit} className="w-full max-w-xs">
-                Verify & Process
+                Verify & Process Payment
               </Button>
             </div>
           ) : paymentComplete ? (
@@ -458,11 +468,18 @@ const QRScanner: React.FC = () => {
             onClick={resetScanner}
             className="w-full"
             variant={paymentComplete || processingStatus === "error" ? "default" : "outline"}
-            disabled={!["complete", "error"].includes(processingStatus) && !paymentComplete}
+            disabled={
+              processingStatus === "verifying" || processingStatus === "storing" || processingStatus === "syncing"
+            }
           >
-            {paymentComplete || processingStatus === "complete" || processingStatus === "error"
-              ? "Scan Another"
-              : "Processing..."}
+            {paymentComplete || processingStatus === "complete" || processingStatus === "error" ? (
+              <>
+                <RefreshCw className="mr-2 h-4 w-4" />
+                Scan Another QR Code
+              </>
+            ) : (
+              "Processing..."
+            )}
           </Button>
         </CardFooter>
       </Card>

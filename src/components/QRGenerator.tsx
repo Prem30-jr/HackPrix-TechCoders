@@ -1,13 +1,14 @@
 "use client"
 
 import type React from "react"
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { motion } from "framer-motion"
 import { QRCodeSVG } from "qrcode.react"
 import type { Transaction, QRData } from "../types"
 import { generateId, signTransaction } from "../utils/crypto"
-import { saveTransaction } from "../utils/storage"
+import { saveTransaction, addReceivedTransaction, updateTransactionStatus } from "../utils/storage"
 import { notificationService } from "../utils/notifications"
+import { paymentEventManager } from "../utils/paymentEvents"
 import { Button } from "./ui/button"
 import { Input } from "./ui/input"
 import { Label } from "./ui/label"
@@ -15,7 +16,7 @@ import { Textarea } from "./ui/textarea"
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "./ui/card"
 import { toast } from "./ui/use-toast"
 import { Badge } from "./ui/badge"
-import { ShieldCheck, Clock, QrCode, Sparkles, Copy, Download, CheckCircle, Volume2, VolumeX } from "lucide-react"
+import { ShieldCheck, Clock, QrCode, Sparkles, Copy, Download, CheckCircle, Volume2, VolumeX, RefreshCw } from 'lucide-react'
 
 const QRGenerator: React.FC = () => {
   const [amount, setAmount] = useState<string>("")
@@ -23,21 +24,61 @@ const QRGenerator: React.FC = () => {
   const [description, setDescription] = useState<string>("")
   const [qrData, setQrData] = useState<QRData | null>(null)
   const [isGenerating, setIsGenerating] = useState<boolean>(false)
-  const [timeLeft, setTimeLeft] = useState<number>(10)
+  const [timeLeft, setTimeLeft] = useState<number>(30) // Increased to 30 seconds
   const [isExpired, setIsExpired] = useState<boolean>(false)
   const [paymentReceived, setPaymentReceived] = useState<boolean>(false)
   const [paymentDetails, setPaymentDetails] = useState<any>(null)
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true)
 
+  // Handle payment received events
+  const handlePaymentReceived = useCallback((eventData: any) => {
+    console.log("Payment received event:", eventData)
+    
+    if (qrData && eventData.transactionId === qrData.transaction.id) {
+      console.log("Payment received for current QR code")
+      
+      setPaymentReceived(true)
+      setPaymentDetails({
+        amount: eventData.amount,
+        sender: eventData.sender,
+        recipient: eventData.recipient,
+        timestamp: eventData.timestamp,
+        transactionId: eventData.transactionId
+      })
+
+      // Update transaction status and add to history
+      updateTransactionStatus(qrData.transaction.id, "verified")
+      addReceivedTransaction(qrData.transaction)
+
+      // Play notification sound and show push notification
+      if (soundEnabled) {
+        notificationService.notifyPaymentReceived(eventData.amount, eventData.sender)
+      }
+
+      toast({
+        title: "Payment Received!",
+        description: `₹${eventData.amount.toFixed(2)} received successfully from ${eventData.sender.substring(0, 8)}...`,
+      })
+    }
+  }, [qrData, soundEnabled])
+
+  useEffect(() => {
+    // Subscribe to payment events
+    const unsubscribe = paymentEventManager.subscribe('paymentReceived', handlePaymentReceived)
+    
+    return unsubscribe
+  }, [handlePaymentReceived])
+
   useEffect(() => {
     let timer: NodeJS.Timeout
 
-    if (qrData && !isExpired) {
+    if (qrData && !isExpired && !paymentReceived) {
       timer = setInterval(() => {
         setTimeLeft((prev) => {
           if (prev <= 1) {
             setIsExpired(true)
-            setQrData(null)
+            paymentEventManager.emitQRExpired(qrData.transaction.id)
+            
             if (soundEnabled) {
               notificationService.notifyError("QR code has expired. Please generate a new one.")
             }
@@ -56,50 +97,7 @@ const QRGenerator: React.FC = () => {
     return () => {
       if (timer) clearInterval(timer)
     }
-  }, [qrData, isExpired, soundEnabled])
-
-  useEffect(() => {
-    if (!qrData) return
-
-    // Listen for payment completion events
-    const handlePaymentReceived = (event: CustomEvent) => {
-      const { transactionId, amount: paidAmount, sender } = event.detail
-
-      if (transactionId === qrData.transaction.id) {
-        setPaymentReceived(true)
-        setPaymentDetails({
-          amount: paidAmount,
-          sender: sender,
-          timestamp: Date.now(),
-        })
-
-        // Automatically add received payment to transaction history
-        const { addReceivedTransaction, updateTransactionStatus } = require("../utils/storage")
-
-        // Update the original transaction status to completed
-        updateTransactionStatus(qrData.transaction.id, "verified")
-
-        // Add a new transaction entry for the received payment
-        addReceivedTransaction(qrData.transaction)
-
-        // Play notification sound and show push notification
-        if (soundEnabled) {
-          notificationService.notifyPaymentReceived(paidAmount, sender)
-        }
-
-        toast({
-          title: "Payment Received!",
-          description: `₹${paidAmount.toFixed(2)} received successfully from ${sender.substring(0, 8)}... Added to transaction history.`,
-        })
-      }
-    }
-
-    window.addEventListener("paymentReceived", handlePaymentReceived as EventListener)
-
-    return () => {
-      window.removeEventListener("paymentReceived", handlePaymentReceived as EventListener)
-    }
-  }, [qrData, soundEnabled])
+  }, [qrData, isExpired, paymentReceived, soundEnabled])
 
   const handleGenerate = () => {
     if (!amount || !recipient) {
@@ -129,9 +127,11 @@ const QRGenerator: React.FC = () => {
 
     setIsGenerating(true)
     setIsExpired(false)
-    setTimeLeft(10)
+    setPaymentReceived(false)
+    setPaymentDetails(null)
+    setTimeLeft(30)
 
-    const sender = "wallet_" + Math.random().toString(36).substring(2, 6)
+    const sender = "wallet_" + Math.random().toString(36).substring(2, 8)
     const publicKey = "pk_demo"
 
     const transaction: Transaction = {
@@ -145,7 +145,6 @@ const QRGenerator: React.FC = () => {
     }
 
     const fakePrivateKey = "sk_demo"
-
     const signature = signTransaction(transaction, fakePrivateKey)
     transaction.signature = signature
 
@@ -155,10 +154,6 @@ const QRGenerator: React.FC = () => {
     }
 
     console.log("Generated QR data:", newQrData)
-    const qrString = JSON.stringify(newQrData)
-    console.log("QR data string length:", qrString.length)
-    console.log("QR data as string:", qrString)
-
     saveTransaction(transaction)
 
     setTimeout(() => {
@@ -172,7 +167,7 @@ const QRGenerator: React.FC = () => {
 
       toast({
         title: "QR Code Generated",
-        description: "Transaction has been digitally signed and is ready to share. Valid for 10 seconds.",
+        description: "Transaction has been digitally signed and is ready to share. Valid for 30 seconds.",
       })
     }, 500)
   }
@@ -183,7 +178,7 @@ const QRGenerator: React.FC = () => {
     setRecipient("")
     setDescription("")
     setIsExpired(false)
-    setTimeLeft(10)
+    setTimeLeft(30)
     setPaymentReceived(false)
     setPaymentDetails(null)
   }
@@ -348,7 +343,7 @@ const QRGenerator: React.FC = () => {
                   <div className="space-y-2 text-sm">
                     <div className="flex justify-between">
                       <span className="text-muted-foreground">Transaction ID:</span>
-                      <span className="font-mono">{qrData?.transaction.id.substring(0, 8)}...</span>
+                      <span className="font-mono">{paymentDetails?.transactionId?.substring(0, 8)}...</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-muted-foreground">Time:</span>
@@ -375,7 +370,37 @@ const QRGenerator: React.FC = () => {
                 onClick={handleReset}
                 className="w-full bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white font-semibold"
               >
+                <RefreshCw className="mr-2 h-4 w-4" />
                 Generate Another QR Code
+              </Button>
+            </CardFooter>
+          </Card>
+        </motion.div>
+      ) : isExpired ? (
+        <motion.div
+          initial={{ opacity: 0, scale: 0.9 }}
+          animate={{ opacity: 1, scale: 1 }}
+          transition={{ duration: 0.3 }}
+        >
+          <Card className="bg-white shadow-2xl border-0 w-full overflow-hidden">
+            <CardHeader className="bg-gradient-to-r from-red-500 to-red-600 text-white text-center py-8">
+              <CardTitle className="text-2xl font-bold">QR Code Expired</CardTitle>
+              <p className="text-red-100 mt-2">Please generate a new QR code</p>
+            </CardHeader>
+            <CardContent className="flex flex-col items-center pt-8 pb-6">
+              <div className="text-center">
+                <p className="text-muted-foreground mb-4">
+                  The QR code has expired for security reasons. Generate a new one to receive payments.
+                </p>
+              </div>
+            </CardContent>
+            <CardFooter className="bg-muted/30 pt-6">
+              <Button
+                onClick={handleReset}
+                className="w-full bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white font-semibold"
+              >
+                <RefreshCw className="mr-2 h-4 w-4" />
+                Generate New QR Code
               </Button>
             </CardFooter>
           </Card>
@@ -446,6 +471,7 @@ const QRGenerator: React.FC = () => {
                 onClick={handleReset}
                 className="w-full bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white font-semibold"
               >
+                <RefreshCw className="mr-2 h-4 w-4" />
                 Generate Another QR Code
               </Button>
             </CardFooter>
@@ -454,7 +480,7 @@ const QRGenerator: React.FC = () => {
           <div className="text-xs text-muted-foreground text-center max-w-xs bg-white/80 backdrop-blur-sm rounded-lg p-4 shadow-sm">
             <ShieldCheck className="h-4 w-4 inline mr-1 text-green-500" />
             This QR code contains a cryptographically signed transaction and will expire in {timeLeft} seconds. When
-            scanned, the recipient's credits will be automatically updated.
+            scanned, the payment will be processed securely.
           </div>
         </motion.div>
       )}
