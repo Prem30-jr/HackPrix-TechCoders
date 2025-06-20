@@ -1,7 +1,7 @@
 "use client"
 
 import type React from "react"
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import { motion } from "framer-motion"
 import { QRCodeSVG } from "qrcode.react"
 import type { Transaction, QRData } from "../types"
@@ -16,7 +16,18 @@ import { Textarea } from "./ui/textarea"
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "./ui/card"
 import { toast } from "./ui/use-toast"
 import { Badge } from "./ui/badge"
-import { ShieldCheck, Clock, QrCode, Sparkles, Copy, Download, CheckCircle, Volume2, VolumeX, RefreshCw } from 'lucide-react'
+import {
+  ShieldCheck,
+  Clock,
+  QrCode,
+  Sparkles,
+  Copy,
+  Download,
+  CheckCircle,
+  Volume2,
+  VolumeX,
+  RefreshCw,
+} from "lucide-react"
 
 const QRGenerator: React.FC = () => {
   const [amount, setAmount] = useState<string>("")
@@ -24,61 +35,120 @@ const QRGenerator: React.FC = () => {
   const [description, setDescription] = useState<string>("")
   const [qrData, setQrData] = useState<QRData | null>(null)
   const [isGenerating, setIsGenerating] = useState<boolean>(false)
-  const [timeLeft, setTimeLeft] = useState<number>(30) // Increased to 30 seconds
+  const [timeLeft, setTimeLeft] = useState<number>(30)
   const [isExpired, setIsExpired] = useState<boolean>(false)
   const [paymentReceived, setPaymentReceived] = useState<boolean>(false)
   const [paymentDetails, setPaymentDetails] = useState<any>(null)
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true)
 
-  // Handle payment received events
-  const handlePaymentReceived = useCallback((eventData: any) => {
-    console.log("Payment received event:", eventData)
-    
-    if (qrData && eventData.transactionId === qrData.transaction.id) {
-      console.log("Payment received for current QR code")
-      
-      setPaymentReceived(true)
-      setPaymentDetails({
-        amount: eventData.amount,
-        sender: eventData.sender,
-        recipient: eventData.recipient,
-        timestamp: eventData.timestamp,
-        transactionId: eventData.transactionId
-      })
+  const timerRef = useRef<NodeJS.Timeout | null>(null)
+  const unsubscribeRef = useRef<(() => void) | null>(null)
 
-      // Update transaction status and add to history
-      updateTransactionStatus(qrData.transaction.id, "verified")
-      addReceivedTransaction(qrData.transaction)
+  // Enhanced payment received handler with immediate response
+  const handlePaymentReceived = useCallback(
+    (eventData: any) => {
+      console.log("🎯 QRGenerator: Payment received event:", eventData)
 
-      // Play notification sound and show push notification
-      if (soundEnabled) {
-        notificationService.notifyPaymentReceived(eventData.amount, eventData.sender)
+      if (qrData && eventData.transactionId === qrData.transaction.id) {
+        console.log("✅ QRGenerator: Payment received for current QR code - IMMEDIATE UPDATE")
+
+        // IMMEDIATELY stop the timer and update state
+        if (timerRef.current) {
+          clearInterval(timerRef.current)
+          timerRef.current = null
+        }
+
+        // Set payment received state immediately
+        setPaymentReceived(true)
+        setIsExpired(false) // Ensure expired state is false
+
+        setPaymentDetails({
+          amount: eventData.amount,
+          sender: eventData.sender,
+          recipient: eventData.recipient,
+          timestamp: eventData.timestamp,
+          transactionId: eventData.transactionId,
+        })
+
+        // Update transaction status and add to history
+        try {
+          updateTransactionStatus(qrData.transaction.id, "verified")
+          addReceivedTransaction(qrData.transaction)
+        } catch (error) {
+          console.error("Error updating transaction:", error)
+        }
+
+        // Play notification sound and show push notification
+        if (soundEnabled) {
+          notificationService.notifyPaymentReceived(eventData.amount, eventData.sender)
+        }
+
+        toast({
+          title: "💰 Payment Received!",
+          description: `₹${eventData.amount.toFixed(2)} received successfully from ${eventData.sender.substring(0, 8)}...`,
+        })
+
+        console.log("🎉 QRGenerator: Payment received state updated successfully")
+      } else {
+        console.log("⚠️ QRGenerator: Payment received but not for current QR code", {
+          currentQRId: qrData?.transaction.id,
+          eventTransactionId: eventData.transactionId,
+        })
       }
+    },
+    [qrData, soundEnabled],
+  )
 
-      toast({
-        title: "Payment Received!",
-        description: `₹${eventData.amount.toFixed(2)} received successfully from ${eventData.sender.substring(0, 8)}...`,
-      })
-    }
-  }, [qrData, soundEnabled])
-
+  // Set up event listeners
   useEffect(() => {
-    // Subscribe to payment events
-    const unsubscribe = paymentEventManager.subscribe('paymentReceived', handlePaymentReceived)
-    
-    return unsubscribe
+    console.log("🔄 QRGenerator: Setting up payment event listeners")
+
+    // Clean up previous subscription
+    if (unsubscribeRef.current) {
+      unsubscribeRef.current()
+    }
+
+    // Subscribe to payment events with multiple methods
+    const unsubscribe1 = paymentEventManager.subscribe("paymentReceived", handlePaymentReceived)
+
+    // Also listen to DOM events as backup
+    const handleDOMEvent = (event: any) => {
+      console.log("📢 QRGenerator: DOM event received:", event.detail)
+      handlePaymentReceived(event.detail)
+    }
+
+    window.addEventListener("paymentReceived", handleDOMEvent)
+    document.addEventListener("paymentReceived", handleDOMEvent)
+
+    // Store cleanup function
+    unsubscribeRef.current = () => {
+      unsubscribe1()
+      window.removeEventListener("paymentReceived", handleDOMEvent)
+      document.removeEventListener("paymentReceived", handleDOMEvent)
+    }
+
+    return unsubscribeRef.current
   }, [handlePaymentReceived])
 
+  // Timer management
   useEffect(() => {
-    let timer: NodeJS.Timeout
+    // Clear any existing timer
+    if (timerRef.current) {
+      clearInterval(timerRef.current)
+      timerRef.current = null
+    }
 
+    // Only start timer if QR exists, not expired, and payment not received
     if (qrData && !isExpired && !paymentReceived) {
-      timer = setInterval(() => {
+      console.log("⏰ QRGenerator: Starting countdown timer")
+
+      timerRef.current = setInterval(() => {
         setTimeLeft((prev) => {
           if (prev <= 1) {
+            console.log("⏰ QRGenerator: Timer expired")
             setIsExpired(true)
             paymentEventManager.emitQRExpired(qrData.transaction.id)
-            
+
             if (soundEnabled) {
               notificationService.notifyError("QR code has expired. Please generate a new one.")
             }
@@ -95,7 +165,10 @@ const QRGenerator: React.FC = () => {
     }
 
     return () => {
-      if (timer) clearInterval(timer)
+      if (timerRef.current) {
+        clearInterval(timerRef.current)
+        timerRef.current = null
+      }
     }
   }, [qrData, isExpired, paymentReceived, soundEnabled])
 
@@ -153,7 +226,7 @@ const QRGenerator: React.FC = () => {
       publicKey,
     }
 
-    console.log("Generated QR data:", newQrData)
+    console.log("🔄 QRGenerator: Generated QR data:", newQrData)
     saveTransaction(transaction)
 
     setTimeout(() => {
@@ -173,6 +246,14 @@ const QRGenerator: React.FC = () => {
   }
 
   const handleReset = () => {
+    console.log("🔄 QRGenerator: Resetting component")
+
+    // Clear timer
+    if (timerRef.current) {
+      clearInterval(timerRef.current)
+      timerRef.current = null
+    }
+
     setQrData(null)
     setAmount("")
     setRecipient("")
@@ -216,6 +297,17 @@ const QRGenerator: React.FC = () => {
       description: soundEnabled ? "Notifications will be silent" : "Sound notifications enabled",
     })
   }
+
+  // Debug info
+  useEffect(() => {
+    console.log("🔍 QRGenerator State:", {
+      hasQrData: !!qrData,
+      paymentReceived,
+      isExpired,
+      timeLeft,
+      transactionId: qrData?.transaction.id,
+    })
+  }, [qrData, paymentReceived, isExpired, timeLeft])
 
   return (
     <div className="w-full max-w-md mx-auto">
@@ -326,7 +418,7 @@ const QRGenerator: React.FC = () => {
                   <CheckCircle className="h-12 w-12" />
                 </motion.div>
               </div>
-              <CardTitle className="text-2xl font-bold">Payment Received!</CardTitle>
+              <CardTitle className="text-2xl font-bold">💰 Payment Received!</CardTitle>
               <p className="text-green-100 mt-2">Transaction completed successfully</p>
             </CardHeader>
 
@@ -351,7 +443,7 @@ const QRGenerator: React.FC = () => {
                     </div>
                     <div className="flex justify-between">
                       <span className="text-muted-foreground">Status:</span>
-                      <Badge className="bg-green-500 text-white">Completed</Badge>
+                      <Badge className="bg-green-500 text-white">✅ Completed</Badge>
                     </div>
                   </div>
                 </div>
@@ -384,7 +476,7 @@ const QRGenerator: React.FC = () => {
         >
           <Card className="bg-white shadow-2xl border-0 w-full overflow-hidden">
             <CardHeader className="bg-gradient-to-r from-red-500 to-red-600 text-white text-center py-8">
-              <CardTitle className="text-2xl font-bold">QR Code Expired</CardTitle>
+              <CardTitle className="text-2xl font-bold">⏰ QR Code Expired</CardTitle>
               <p className="text-red-100 mt-2">Please generate a new QR code</p>
             </CardHeader>
             <CardContent className="flex flex-col items-center pt-8 pb-6">
